@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""42run: compile a .c file with 42 flags, call its last function, run norminette."""
+import os
+import sys
+import signal
+import ctypes
+import re
+import shutil
+import tempfile
+import subprocess
+
+VERSION = "1.2.0"
+HOME_DIR = os.path.dirname(os.path.realpath(__file__))
+
+try:
+    from elftools.elf.elffile import ELFFile
+except ImportError:
+    sys.path.insert(0, os.path.join(HOME_DIR, "vendor"))
+    from elftools.elf.elffile import ELFFile
+
+SKIP = ("DW_TAG_const_type", "DW_TAG_volatile_type", "DW_TAG_typedef")
+INT_T = {1: ctypes.c_int8, 2: ctypes.c_int16, 4: ctypes.c_int, 8: ctypes.c_long}
+UINT_T = {1: ctypes.c_uint8, 2: ctypes.c_uint16, 4: ctypes.c_uint, 8: ctypes.c_ulong}
+FLOATS = (ctypes.c_float, ctypes.c_double)
+
+USAGE = """usage: 42run [options] file.c
+
+options:
+  -n, --no-norm   skip the norminette report
+  -w, --watch     open a new terminal running 'watch norminette file.c'
+  -u, --update    update 42run (git pull)
+  -v, --version   print version
+  -h, --help      show this help"""
+
+
+def target(die):
+    if "DW_AT_type" in die.attributes:
+        return die.get_DIE_from_attribute("DW_AT_type")
+    return None
+
+
+def resolve(die):
+    while die is not None and die.tag in SKIP:
+        die = target(die)
+    if die is None:
+        return ("void", None)
+    if die.tag == "DW_TAG_base_type":
+        size = die.attributes["DW_AT_byte_size"].value
+        enc = die.attributes["DW_AT_encoding"].value
+        if enc == 4:
+            return ("float", ctypes.c_float if size == 4 else ctypes.c_double)
+        if enc in (6, 8) and size == 1:
+            return ("char", ctypes.c_char)
+        if enc in (2, 7):
+            return ("int", UINT_T.get(size, ctypes.c_uint))
+        return ("int", INT_T.get(size, ctypes.c_int))
+    if die.tag == "DW_TAG_pointer_type":
+        kind, ct = resolve(target(die))
+        if kind == "char":
+            return ("str", ctypes.c_char_p)
+        if kind == "str":
+            return ("strarray", ctypes.POINTER(ctypes.c_char_p))
+        if kind in ("int", "float"):
+            return ("array", ctypes.POINTER(ct))
+    return ("ptr", ctypes.c_void_p)
+
+
+def find_last_function(path):
+    best = None
+    with open(path, "rb") as f:
+        elf = ELFFile(f)
+        if not elf.has_dwarf_info():
+            sys.exit("42run: no debug info found.")
+        for cu in elf.get_dwarf_info().iter_CUs():
+            for die in cu.iter_DIEs():
+                a = die.attributes
+                if die.tag != "DW_TAG_subprogram" or "DW_AT_low_pc" not in a:
+                    continue
+                if "DW_AT_name" not in a or "DW_AT_decl_line" not in a:
+                    continue
+                line = a["DW_AT_decl_line"].value
+                if best is None or line > best[0]:
+                    params = []
+                    for ch in die.iter_children():
+                        if ch.tag == "DW_TAG_formal_parameter":
+                            pname = ch.attributes["DW_AT_name"].value.decode()
+                            ptype = ch.get_DIE_from_attribute("DW_AT_type")
+                            params.append((pname, *resolve(ptype)))
+                    best = (line, a["DW_AT_name"].value.decode(), params,
+                            resolve(target(die)), "DW_AT_external" in a)
+    if best is None:
+        sys.exit("42run: no functions found.")
+    return best[1:]
+
+
+def make_argv(words, keep):
+    arr = (ctypes.c_char_p * (len(words) + 1))(*[w.encode() for w in words], None)
+    keep.append(arr)
+    return ctypes.cast(arr, ctypes.POINTER(ctypes.c_char_p))
+
+
+def ask(name, kind, ct, keep):
+    if kind == "int":
+        return ct(int(input(f"{name} (int): ")))
+    if kind == "float":
+        return ct(float(input(f"{name} (float): ")))
+    if kind == "char":
+        return ct(input(f"{name} (char): ")[:1].encode())
+    if kind == "str":
+        buf = ctypes.create_string_buffer(input(f"{name} (string): ").encode())
+        keep.append(buf)
+        return ctypes.cast(buf, ctypes.c_char_p)
+    if kind == "array":
+        elem = ct._type_
+        conv = float if elem in FLOATS else int
+        vals = [conv(v) for v in input(f"{name} (comma-separated numbers): ").split(",")]
+        arr = (elem * len(vals))(*vals)
+        keep.append(arr)
+        return ctypes.cast(arr, ct)
+    if kind == "strarray":
+        words = input(f"{name} (space-separated words): ").split()
+        return make_argv(words, keep)
+    return ctypes.c_void_p(int(input(f"{name} (pointer address, 0 = NULL): ") or 0))
+
+
+def run(so):
+    name, params, (rkind, rtype), external = find_last_function(so)
+    print(f"42run: calling {name}({', '.join(p[0] for p in params)})")
+    if not external:
+        sys.exit(f"42run: '{name}' is static, so it can't be called from outside.")
+
+    libc = ctypes.CDLL(None)
+    fn = getattr(ctypes.CDLL(so), name)
+    fn.argtypes = [p[2] for p in params]
+    fn.restype = rtype
+
+    keep, args = [], []
+    if name == "main" and len(params) == 2 and params[1][1] == "strarray":
+        words = ["./a.out"] + input("args (argv[0] is added for you): ").split()
+        args = [ctypes.c_int(len(words)), make_argv(words, keep)]
+    else:
+        for pname, kind, ct in params:
+            args.append(ask(pname, kind, ct, keep))
+
+    print("--- output ---")
+    sys.stdout.flush()
+    old = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    pid = os.fork()
+    if pid == 0:
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        libc.prctl(1, signal.SIGKILL)
+        res = fn(*args)
+        libc.fflush(None)
+        if rkind != "void":
+            os.write(1, f"\n--- returned: {res!r} ---\n".encode())
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    signal.signal(signal.SIGINT, old)
+    if os.WIFSIGNALED(status):
+        sig = signal.Signals(os.WTERMSIG(status)).name
+        what = "interrupted" if sig == "SIGINT" else "crashed"
+        print(f"\n--- {what}: {sig} ---")
+
+
+def norminette(src):
+    print("\n--- norminette ---")
+    sys.stdout.flush()
+    if shutil.which("norminette") is None:
+        print("42run: norminette not found in PATH")
+        return
+    res = subprocess.run(["norminette", src], capture_output=True, text=True)
+    out = res.stdout + res.stderr
+    count = len(re.findall(r"^(?:Error|Notice):", out, re.M))
+    if count == 0 and res.returncode != 0:
+        print("42run: norminette failed to run:")
+        print(out.strip())
+    elif count == 0:
+        print("OK")
+    else:
+        print(f"NOT OK ({count} issue{'s' if count != 1 else ''})")
+
+
+TERMINALS = [
+    ("ghostty", ["-e"]),
+    ("kitty", ["-e"]),
+    ("alacritty", ["-e"]),
+    ("foot", []),
+    ("wezterm", ["start", "--"]),
+    ("gnome-terminal", ["--"]),
+    ("konsole", ["-e"]),
+    ("xfce4-terminal", ["-x"]),
+    ("tilix", ["-e"]),
+    ("x-terminal-emulator", ["-e"]),
+    ("xterm", ["-e"]),
+]
+
+
+def watch(src):
+    if shutil.which("watch") is None:
+        print("42run: 'watch' not found in PATH, can't open the norminette window")
+        return
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        print("42run: no graphical session found, can't open a new terminal")
+        return
+    choices = list(TERMINALS)
+    env_term = os.path.basename(os.environ.get("TERMINAL", ""))
+    if env_term:
+        known = dict(TERMINALS)
+        choices.insert(0, (env_term, known.get(env_term, ["-e"])))
+    for term, flags in choices:
+        if shutil.which(term) is None:
+            continue
+        cmd = [term] + flags + ["watch", "-n", "1", "-c", "norminette", src]
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        print(f"42run: watching norminette in {term}")
+        return
+    print("42run: no supported terminal emulator found (set $TERMINAL)")
+
+
+def update():
+    if not os.path.isdir(os.path.join(HOME_DIR, ".git")):
+        sys.exit("42run: not a git checkout, can't update.")
+    sys.exit(subprocess.run(["git", "-C", HOME_DIR, "pull", "--ff-only"]).returncode)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or "-h" in args or "--help" in args:
+        sys.exit(USAGE)
+    if "-v" in args or "--version" in args:
+        sys.exit(f"42run {VERSION}")
+    if "-u" in args or "--update" in args:
+        update()
+    norm = not ("-n" in args or "--no-norm" in args)
+    files = [a for a in args if not a.startswith("-")]
+    if len(files) != 1 or not files[0].endswith(".c"):
+        sys.exit(USAGE)
+    src = os.path.abspath(files[0])
+    if not os.path.isfile(src):
+        sys.exit(f"42run: {src}: no such file")
+    if shutil.which("cc") is None:
+        sys.exit("42run: no C compiler ('cc') found in PATH")
+    if "-w" in args or "--watch" in args:
+        watch(src)
+    with tempfile.TemporaryDirectory(prefix="42run_") as tmp:
+        so = os.path.join(tmp, "lib.so")
+        cmd = ["cc", "-Wall", "-Wextra", "-Werror", "-g", "-shared", "-fPIC", "-o", so, src]
+        try:
+            if subprocess.run(cmd).returncode == 0:
+                run(so)
+        finally:
+            if norm:
+                norminette(src)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        sys.exit(130)
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(141)
