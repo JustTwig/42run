@@ -2,7 +2,7 @@
 
 Test any C function without writing a `main`.
 
-Point 42run at a `.c` file and it compiles it with the 42 flags, asks you for the arguments of the last function in the file, calls it, and tells you whether norminette is happy. Made for the piscine, where half the time goes into throwaway test mains.
+Point 42run at a `.c` file and it compiles it with the 42 flags, asks you for the arguments of **the last function** in the file, calls it, and tells you whether norminette is happy. Made for the piscine, where half the time goes into throwaway test mains.
 
 ```
 $ 42run ft_print_string.c
