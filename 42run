@@ -24,10 +24,11 @@ UINT_T = {1: ctypes.c_uint8, 2: ctypes.c_uint16, 4: ctypes.c_uint, 8: ctypes.c_u
 FLOATS = (ctypes.c_float, ctypes.c_double)
 
 USAGE = """usage: 42run [options] file.c
+       42run -w [file.c]
 
 options:
   -n, --no-norm   skip the norminette report
-  -w, --watch     open a new terminal running 'watch norminette file.c'
+  -w, --watch     open a new terminal running 'watch norminette [file.c]', then exit
   -u, --update    update 42run (git pull)
   -v, --version   print version
   -h, --help      show this help"""
@@ -195,7 +196,7 @@ TERMINALS = [
 ]
 
 
-def watch(src):
+def watch(src=None):
     if shutil.which("watch") is None:
         print("42run: 'watch' not found in PATH, can't open the norminette window")
         return
@@ -210,7 +211,11 @@ def watch(src):
     for term, flags in choices:
         if shutil.which(term) is None:
             continue
-        cmd = [term] + flags + ["watch", "-n", "1", "-c", "norminette", src]
+        if src is None:
+            inner = ["sh", "-c", 'cd "$1" && exec watch -n 1 -c norminette', "sh", os.getcwd()]
+        else:
+            inner = ["watch", "-n", "1", "-c", "norminette", src]
+        cmd = [term] + flags + inner
         subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)
         print(f"42run: watching norminette in {term}")
@@ -234,15 +239,20 @@ def main():
         update()
     norm = not ("-n" in args or "--no-norm" in args)
     files = [a for a in args if not a.startswith("-")]
+    watching = "-w" in args or "--watch" in args
+    if watching and not files:
+        watch()
+        return
     if len(files) != 1 or not files[0].endswith(".c"):
         sys.exit(USAGE)
     src = os.path.abspath(files[0])
     if not os.path.isfile(src):
         sys.exit(f"42run: {src}: no such file")
+    if watching:
+        watch(src)
+        return
     if shutil.which("cc") is None:
         sys.exit("42run: no C compiler ('cc') found in PATH")
-    if "-w" in args or "--watch" in args:
-        watch(src)
     with tempfile.TemporaryDirectory(prefix="42run_") as tmp:
         so = os.path.join(tmp, "lib.so")
         cmd = ["cc", "-Wall", "-Wextra", "-Werror", "-g", "-shared", "-fPIC", "-o", so, src]

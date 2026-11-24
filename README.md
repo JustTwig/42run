@@ -29,17 +29,18 @@ This links `~/.local/bin/42run` and adds `~/.local/bin` to your `PATH` if it's m
 
 ```
 42run [options] file.c
+42run -w [file.c]
 ```
 
 | Flag              | What it does                                                        |
 |-------------------|---------------------------------------------------------------------|
 | `-n`, `--no-norm` | Skip the norminette report at the end                               |
-| `-w`, `--watch`   | Open a new terminal running `watch norminette file.c`               |
+| `-w`, `--watch`   | Open a new terminal running `watch norminette [file.c]`, then exit  |
 | `-u`, `--update`  | Update 42run (`git pull`)                                           |
 | `-v`, `--version` | Print the version                                                   |
 | `-h`, `--help`    | Show the help                                                       |
 
-`-w` needs a graphical session and `watch` installed. It tries `$TERMINAL` first, then common terminals (ghostty, kitty, alacritty, foot, wezterm, gnome-terminal, konsole, xfce4-terminal, tilix, xterm). The window stays open after 42run exits, so you can keep editing and see the result update every second.
+`-w` needs a graphical session and `watch` installed. It never compiles or runs anything: `42run -w` watches the current directory (like running `norminette` with no arguments), and `42run -w file.c` watches that one file. It tries `$TERMINAL` first, then common terminals (ghostty, kitty, alacritty, foot, wezterm, gnome-terminal, konsole, xfce4-terminal, tilix, xterm). The window stays open after 42run exits, so you can keep editing and see the result update every second.
 
 It asks for each parameter by name and type:
 
